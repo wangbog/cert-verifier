@@ -12,6 +12,8 @@ from cert_verifier import IssuerInfo, IssuerKey
 from cert_verifier import TransactionData
 from cert_verifier.errors import *
 
+from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
+
 headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36'}
 
@@ -59,6 +61,30 @@ class TransactionLookupConnector:
         """
         return None
 
+class TransactionLookupConnector2:
+    """
+    Abstract connector for looking up transactions with local full node json-rpc
+    """
+
+    def __init__(self):
+        self.url = None
+
+    def lookup_tx(self, txid):
+        json_response = self.fetch_tx(txid)
+        return self.parse_tx(json_response)
+
+    def fetch_tx(self, txid):
+        rpc_connection = AuthServiceProxy("http://%s:%s@127.0.0.1:8332" % ('wb626', 'ccpku@1023'))
+        rawtx = rpc_connection.getrawtransaction(txid,1)
+        return rawtx
+
+    def parse_tx(self, json_response):
+        """
+        Abstract method for parsing json response
+        :param json_response: json returned by transaction connector
+        :return: TransactionData
+        """
+        return None
 
 class MockConnector(TransactionLookupConnector):
     def __init__(self, chain):
@@ -70,7 +96,8 @@ class MockConnector(TransactionLookupConnector):
 class FallbackConnector(TransactionLookupConnector):
     def __init__(self, chain):
         self.chain = chain
-        self.connectors = [BlockchainInfoConnector(chain), BlockcypherConnector(chain)]
+        #self.connectors = [BlockchainInfoConnector(chain), BlockcypherConnector(chain)]
+        self.connectors = [BitcoindConnector(chain)]
 
     def lookup_tx(self, txid):
         exceptions = []
@@ -83,6 +110,38 @@ class FallbackConnector(TransactionLookupConnector):
                 logging.warning('Error looking up transaction, trying more connectors')
                 exceptions.append(e)
         raise InvalidTransactionError(exceptions)
+
+class BitcoindConnector(TransactionLookupConnector2):
+    """
+    Lookup blockchain transactions using local full node json-rpc. Currently the 'mainnet' and 'testnet' chains are supported in
+    this connector.
+    """
+
+    def __init__(self, chain=Chain.bitcoin_mainnet):
+        if chain == Chain.bitcoin_testnet:
+            self.url = 'http://127.0.0.1:8332/'
+        elif chain == Chain.bitcoin_mainnet:
+            self.url = 'http://127.0.0.1:8332/'
+        else:
+            raise Exception(
+                'unsupported chain (%s) requested with Bitcoind collector. Currently only testnet and mainnet are supported' % chain)
+
+    def parse_tx(self, json_response):
+        revoked = set()
+        script = None
+        # note: time is tx time (received), while blocktime is block time(confirmed) ???
+        time = json_response['time']
+        signing_key = json_response['vout'][0]['scriptPubKey']['addresses'][0]
+        for o in json_response['vout']:
+            if float(o.get('value', 1)) - float('0E-8') < float('0.0001'):
+                script = o.get('scriptPubKey').get('hex')
+            else:
+                if o.get('scriptPubKey').get('hex'):
+                    revoked.add(o.get('scriptPubKey').get('addresses')[0])
+        if not script:
+            logging.error('transaction response is missing op_return script: %s', json_response)
+            raise InvalidTransactionError('transaction response is missing op_return script' % json_response)
+        return TransactionData(signing_key, script, time, revoked)
 
 
 class BlockchainInfoConnector(TransactionLookupConnector):
